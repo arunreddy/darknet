@@ -211,7 +211,7 @@ void print_detector_detections(FILE **fps, char *id, box *boxes, float **probs, 
 }
 
 void
-print_detections(FILE *fps, char *id, box *boxes, float **probs, int total, int classes, char **names, int w, int h) {
+save_detections(FILE *fps, char *id, box *boxes, float **probs, int total, int classes, char **names, int w, int h) {
 
   int i, j;
   for (i = 0; i < total; ++i) {
@@ -465,25 +465,78 @@ void validate_detector_recall(char *cfgfile, char *weightfile) {
   }
 }
 
+void detect_image(char *img_path, network net,char **names, image **alphabet, float thresh,float hier_thresh, int multiple, char *tgt_img_path){
+  char *id = basecfg(img_path);
+  image im = load_image_color(img_path, 0, 0);
+  image sized = resize_image(im, net.w, net.h);
+  layer l = net.layers[net.n - 1];
+  char img_labels[256];
+  float nms = .4;
+  srand(2222222);
+  clock_t time;
+  int j;
+
+
+  box *boxes = calloc(l.w * l.h * l.n, sizeof(box));
+  float **probs = calloc(l.w * l.h * l.n, sizeof(float *));
+  for (j = 0; j < l.w * l.h * l.n; ++j) probs[j] = calloc(l.classes + 1, sizeof(float *));
+
+  int classes = l.classes;
+
+  float *X = sized.data;
+  time = clock();
+  network_predict(net, X);
+  printf("%s: Predicted in %f seconds.\n", img_path, sec(clock() - time));
+  get_region_boxes(l, 1, 1, 0.01, probs, boxes, 0, 0, hier_thresh);
+  if (l.softmax_tree && nms) {
+    do_nms_obj(boxes, probs, l.w * l.h * l.n, l.classes, nms);
+  } else if (nms) {
+    do_nms_sort(boxes, probs, l.w * l.h * l.n, l.classes, nms);
+  }
+  draw_detections(im, l.w * l.h * l.n, thresh, boxes, probs, names, alphabet, l.classes);
+
+  if(!multiple){
+    show_image(im, "predictions");
+    save_image(im, "predictions");
+  }else{
+    char pred_img[512];
+    // Expects tgt_img_path to end with path seperator
+    sprintf(pred_img,"%s/%s",tgt_img_path,id);
+    printf("Saving image to %s\n",pred_img);
+    save_image(im, pred_img);
+
+    FILE *fps;
+    char lbl_file[512];
+    sprintf(lbl_file,"%s/%s.txt",tgt_img_path,id);
+    fps = fopen(lbl_file, "w+");
+    save_detections(fps, id, boxes, probs, l.w * l.h * l.n, classes, names, im.w, im.h);
+    fclose(fps);
+  }
+
+  free_image(im);
+  free_image(sized);
+  free(boxes);
+  free_ptrs((void **) probs, l.w * l.h * l.n);
+  if(!multiple){
+#ifdef OPENCV
+    cvWaitKey(0);
+    cvDestroyAllWindows();
+#endif
+  }
+
+}
+
+
 void test_detector(char *datacfg, char *cfgfile, char *weightfile, char *filename, float thresh, float hier_thresh) {
   list *options = read_data_cfg(datacfg);
   char *name_list = option_find_str(options, "names", "data/names.list");
   char *test_images = option_find_str(options, "test", "data/test.list");
+  char *tgt_img_path = option_find_str(options, "tgt_img_path", "data/test.list");
+
   char **names = get_labels(name_list);
   char *outfile = "TestResults_";
   char *prefix = "data";
-  FILE *fps;
-  char outbuff[4096];
 
-  list *plist = get_paths(test_images);
-  char **paths = (char **) list_to_array(plist);
-
-  int k;
-//    for(k=0 ; k < 1000; ++k)
-//    {
-//    	printf("File %s\n",paths[k]);
-//
-//    }
 
   image **alphabet = load_alphabet();
   network net = parse_network_cfg(cfgfile);
@@ -491,70 +544,67 @@ void test_detector(char *datacfg, char *cfgfile, char *weightfile, char *filenam
     load_weights(&net, weightfile);
   }
   set_batch_network(&net, 1);
-  srand(2222222);
-  clock_t time;
+
   char buff[256];
   char *input = buff;
   int j;
-  float nms = .4;
 
-  for (k = 0; k < 1000; ++k) {
-    if (filename) {
+
+  int k;
+  if(filename){
+    // Test based on the given file extension .jpg: predict the given image, .csv: predict the images and write to the disk.
+    char *dot = strrchr(filename, '.');
+    if(dot && !strcmp(dot, ".txt")){  // list of images.
+      list *plist = get_paths(test_images);
+      char **paths = (char **) list_to_array(plist);
+      printf("Reading images from the file:");
+      for (k = 0; k < 1000; ++k) {
+        printf("\n\n %d",k);
+        strncpy(input, paths[k], 256);
+        detect_image(input, net, names, alphabet, 0.05, hier_thresh,1,tgt_img_path);
+      }
+    }else if(dot && !strcmp(dot, ".jpg")){ // an image.
       printf("File name %s", filename);
       strncpy(input, filename, 256);
-    } else {
-      printf("Enter Image Path: ");
-      printf("File %s\n", paths[k]);
-      strncpy(input, paths[k], 256);
-//            fflush(stdout);
-//            input = fgets(input, 256, stdin);
-//            if(!input) return;
-//            strtok(input, "\n");
+      detect_image(input, net, names, alphabet, thresh, hier_thresh,0,tgt_img_path);
     }
-    char *id = basecfg(paths[k]);
-    image im = load_image_color(input, 0, 0);
-    image sized = resize_image(im, net.w, net.h);
-    layer l = net.layers[net.n - 1];
-    char img_labels[256];
-    strcpy(img_labels,
-           "/media/arun/data/kaggle/the-nature-conservancy-fisheries-monitoring/dataset/darknet-labels/");
-    strcat(img_labels, id);
-    strcat(img_labels, ".txt");
-
-    fps = fopen(img_labels, "w+");
-
-    box *boxes = calloc(l.w * l.h * l.n, sizeof(box));
-    float **probs = calloc(l.w * l.h * l.n, sizeof(float *));
-    for (j = 0; j < l.w * l.h * l.n; ++j) probs[j] = calloc(l.classes + 1, sizeof(float *));
-
-    int classes = l.classes;
-
-    float *X = sized.data;
-    time = clock();
-    network_predict(net, X);
-    printf("%s: Predicted in %f seconds.\n", input, sec(clock() - time));
-    get_region_boxes(l, 1, 1, 0.01, probs, boxes, 0, 0, hier_thresh);
-    if (l.softmax_tree && nms) do_nms_obj(boxes, probs, l.w * l.h * l.n, l.classes, nms);
-    else if (nms) do_nms_sort(boxes, probs, l.w * l.h * l.n, l.classes, nms);
-//        draw_detections(im, l.w*l.h*l.n, thresh, boxes, probs, names, alphabet, l.classes);
-//        save_image(im, "predictions");
-//        show_image(im, "predictions");
-
-    print_detections(fps, id, boxes, probs, l.w * l.h * l.n, classes, names, 0, 0);
-
-    free_image(im);
-    free_image(sized);
-    free(boxes);
-    free_ptrs((void **) probs, l.w * l.h * l.n);
-//#ifdef OPENCV
-//        cvWaitKey(0);
-//        cvDestroyAllWindows();
-//#endif
-//        if (filename) break;
-
-    fclose(fps);
-
   }
+  else{
+    printf("Enter Image Path: ");
+    fflush(stdout);
+    input = fgets(input, 256, stdin);
+    if(!input) return;
+    strtok(input, "\n");
+    detect_image(input, net, names, alphabet, thresh, hier_thresh,0,tgt_img_path);
+  }
+
+
+
+//  for (k = 0; k < 1000; ++k) {
+//    if (filename) {
+//      printf("File name %s", filename);
+//      strncpy(input, filename, 256);
+//    } else {
+////      printf("File %s\n", paths[k]);
+////      strncpy(input, paths[k], 256);
+//        fflush(stdout);
+//        input = fgets(input, 256, stdin);
+//        if(!input) return;
+//        strtok(input, "\n");
+//    }
+//
+////    char *id = basecfg(paths[k]);
+////    image im = load_image_color(input, 0, 0);
+////    image sized = resize_image(im, net.w, net.h);
+////    layer l = net.layers[net.n - 1];
+
+//
+//
+//    if (filename) break;
+//
+//    fclose(fps);
+
+//  }
 
 }
 
